@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # to configure behavior, define $CQL_TEST_HOST to the destination address
-# for Thrift connections, and $CQL_TEST_PORT to the associated port.
+# and $CQL_TEST_PORT to the associated port.
 
 from __future__ import with_statement
 
@@ -837,6 +837,21 @@ class TestCqlshOutput(BaseTestCase):
             ("select tags from songs;", r"""
              tags
              MMMM
+            -------------------------------------------------
+
+             {tags: {'genre': 'metal', 'origin': 'england'}}
+             BYYYYBBBYYYYYYYBBYYYYYYYBBYYYYYYYYBBYYYYYYYYYBB
+
+
+            (1 rows)
+            nnnnnnnn
+            """),
+        ))
+
+        self.assertQueriesGiveColoredOutput((
+            ("select tags as my_tags from songs;", r"""
+             my_tags
+             MMMMMMM
             -------------------------------------------------
 
              {tags: {'genre': 'metal', 'origin': 'england'}}

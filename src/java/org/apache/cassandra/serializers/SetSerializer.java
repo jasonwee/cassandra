@@ -21,23 +21,24 @@ package org.apache.cassandra.serializers;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+import org.apache.cassandra.transport.ProtocolVersion;
 
 public class SetSerializer<T> extends CollectionSerializer<Set<T>>
 {
     // interning instances
-    private static final Map<TypeSerializer<?>, SetSerializer> instances = new HashMap<TypeSerializer<?>, SetSerializer>();
+    private static final ConcurrentMap<TypeSerializer<?>, SetSerializer> instances = new ConcurrentHashMap<TypeSerializer<?>, SetSerializer>();
 
     public final TypeSerializer<T> elements;
     private final Comparator<ByteBuffer> comparator;
 
-    public static synchronized <T> SetSerializer<T> getInstance(TypeSerializer<T> elements, Comparator<ByteBuffer> elementComparator)
+    public static <T> SetSerializer<T> getInstance(TypeSerializer<T> elements, Comparator<ByteBuffer> elementComparator)
     {
         SetSerializer<T> t = instances.get(elements);
         if (t == null)
-        {
-            t = new SetSerializer<T>(elements, elementComparator);
-            instances.put(elements, t);
-        }
+            t = instances.computeIfAbsent(elements, k -> new SetSerializer<>(k, elementComparator) );
         return t;
     }
 
@@ -61,7 +62,7 @@ public class SetSerializer<T> extends CollectionSerializer<Set<T>>
         return value.size();
     }
 
-    public void validateForNativeProtocol(ByteBuffer bytes, int version)
+    public void validateForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
     {
         try
         {
@@ -78,13 +79,22 @@ public class SetSerializer<T> extends CollectionSerializer<Set<T>>
         }
     }
 
-    public Set<T> deserializeForNativeProtocol(ByteBuffer bytes, int version)
+    public Set<T> deserializeForNativeProtocol(ByteBuffer bytes, ProtocolVersion version)
     {
         try
         {
             ByteBuffer input = bytes.duplicate();
             int n = readCollectionSize(input, version);
-            Set<T> l = new LinkedHashSet<T>(n);
+
+            if (n < 0)
+                throw new MarshalException("The data cannot be deserialized as a set");
+
+            // If the received bytes are not corresponding to a set, n might be a huge number.
+            // In such a case we do not want to initialize the set with that initialCapacity as it can result
+            // in an OOM when add is called (see CASSANDRA-12618). On the other hand we do not want to have to resize
+            // the set if we can avoid it, so we put a reasonable limit on the initialCapacity.
+            Set<T> l = new LinkedHashSet<T>(Math.min(n, 256));
+
             for (int i = 0; i < n; i++)
             {
                 ByteBuffer databb = readValue(input, version);

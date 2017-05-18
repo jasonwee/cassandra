@@ -29,6 +29,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.Functions;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Base class for user-defined-aggregates.
@@ -158,15 +159,9 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
             private Object state;
             private boolean needsInit = true;
 
-            public void addInput(int protocolVersion, List<ByteBuffer> values) throws InvalidRequestException
+            public void addInput(ProtocolVersion protocolVersion, List<ByteBuffer> values) throws InvalidRequestException
             {
-                if (needsInit)
-                {
-                    state = initcond != null ? UDHelper.deserialize(stateTypeCodec, protocolVersion, initcond.duplicate()) : null;
-                    stateFunctionDuration = 0;
-                    stateFunctionCount = 0;
-                    needsInit = false;
-                }
+                maybeInit(protocolVersion);
 
                 long startTime = System.nanoTime();
                 stateFunctionCount++;
@@ -183,9 +178,20 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
                 stateFunctionDuration += (System.nanoTime() - startTime) / 1000;
             }
 
-            public ByteBuffer compute(int protocolVersion) throws InvalidRequestException
+            private void maybeInit(ProtocolVersion protocolVersion)
             {
-                assert !needsInit;
+                if (needsInit)
+                {
+                    state = initcond != null ? UDHelper.deserialize(stateTypeCodec, protocolVersion, initcond.duplicate()) : null;
+                    stateFunctionDuration = 0;
+                    stateFunctionCount = 0;
+                    needsInit = false;
+                }
+            }
+
+            public ByteBuffer compute(ProtocolVersion protocolVersion) throws InvalidRequestException
+            {
+                maybeInit(protocolVersion);
 
                 // final function is traced in UDFunction
                 Tracing.trace("Executed UDA {}: {} call(s) to state function {} in {}\u03bcs", name(), stateFunctionCount, stateFunction.name(), stateFunctionDuration);

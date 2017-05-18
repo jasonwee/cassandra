@@ -27,7 +27,7 @@ import java.util.concurrent.*;
 
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.rows.Row;
@@ -55,18 +55,19 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
 {
     private static final Logger logger = LoggerFactory.getLogger(PerSSTableIndexWriter.class);
 
+    private static final int POOL_SIZE = 8;
     private static final ThreadPoolExecutor INDEX_FLUSHER_MEMTABLE;
     private static final ThreadPoolExecutor INDEX_FLUSHER_GENERAL;
 
     static
     {
-        INDEX_FLUSHER_GENERAL = new JMXEnabledThreadPoolExecutor(1, 8, 60, TimeUnit.SECONDS,
+        INDEX_FLUSHER_GENERAL = new JMXEnabledThreadPoolExecutor(POOL_SIZE, POOL_SIZE, 1, TimeUnit.MINUTES,
                                                                  new LinkedBlockingQueue<>(),
                                                                  new NamedThreadFactory("SASI-General"),
                                                                  "internal");
         INDEX_FLUSHER_GENERAL.allowCoreThreadTimeOut(true);
 
-        INDEX_FLUSHER_MEMTABLE = new JMXEnabledThreadPoolExecutor(1, 8, 60, TimeUnit.SECONDS,
+        INDEX_FLUSHER_MEMTABLE = new JMXEnabledThreadPoolExecutor(POOL_SIZE, POOL_SIZE, 1, TimeUnit.MINUTES,
                                                                   new LinkedBlockingQueue<>(),
                                                                   new NamedThreadFactory("SASI-Memtable"),
                                                                   "internal");
@@ -79,10 +80,9 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
     private final OperationType source;
 
     private final AbstractType<?> keyValidator;
-    private final Map<ColumnDefinition, ColumnIndex> supportedIndexes;
 
     @VisibleForTesting
-    protected final Map<ColumnDefinition, Index> indexes;
+    protected final Map<ColumnMetadata, Index> indexes;
 
     private DecoratedKey currentKey;
     private long currentKeyPosition;
@@ -91,13 +91,14 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
     public PerSSTableIndexWriter(AbstractType<?> keyValidator,
                                  Descriptor descriptor,
                                  OperationType source,
-                                 Map<ColumnDefinition, ColumnIndex> supportedIndexes)
+                                 Map<ColumnMetadata, ColumnIndex> supportedIndexes)
     {
         this.keyValidator = keyValidator;
         this.descriptor = descriptor;
         this.source = source;
-        this.supportedIndexes = supportedIndexes;
         this.indexes = new HashMap<>();
+        for (Map.Entry<ColumnMetadata, ColumnIndex> entry : supportedIndexes.entrySet())
+            indexes.put(entry.getKey(), newIndex(entry.getValue()));
     }
 
     public void begin()
@@ -109,33 +110,23 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
         currentKeyPosition = curPosition;
     }
 
-    public void nextUnfilteredCluster(Unfiltered unfiltered, long currentRowOffset)
+    public void nextUnfilteredCluster(Unfiltered unfiltered)
     {
         if (!unfiltered.isRow())
             return;
 
         Row row = (Row) unfiltered;
 
-        supportedIndexes.keySet().forEach((column) -> {
+        indexes.forEach((column, index) -> {
             ByteBuffer value = ColumnIndex.getValueOf(column, row, nowInSec);
             if (value == null)
                 return;
 
-            ColumnIndex columnIndex = supportedIndexes.get(column);
-            if (columnIndex == null)
-                return;
-
-            Index index = indexes.get(column);
             if (index == null)
-                indexes.put(column, (index = newIndex(columnIndex)));
+                throw new IllegalArgumentException("No index exists for column " + column.name.toString());
 
-            index.add(value.duplicate(), currentKey, currentKeyPosition, currentRowOffset);
+            index.add(value.duplicate(), currentKey, currentKeyPosition);
         });
-    }
-
-    public void nextUnfilteredCluster(Unfiltered unfilteredCluster)
-    {
-        throw new UnsupportedOperationException("SASI Index does not support direct row access.");
     }
 
     public void complete()
@@ -160,7 +151,7 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
         }
     }
 
-    public Index getIndex(ColumnDefinition columnDef)
+    public Index getIndex(ColumnMetadata columnDef)
     {
         return indexes.get(columnDef);
     }
@@ -202,7 +193,7 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
             this.currentBuilder = newIndexBuilder();
         }
 
-        public void add(ByteBuffer term, DecoratedKey key, long partitoinOffset, long rowOffset)
+        public void add(ByteBuffer term, DecoratedKey key, long keyPosition)
         {
             if (term.remaining() == 0)
                 return;
@@ -240,7 +231,7 @@ public class PerSSTableIndexWriter implements SSTableFlushObserver
                     }
                 }
 
-                currentBuilder.add(token, key, partitoinOffset, rowOffset);
+                currentBuilder.add(token, key, keyPosition);
                 isAdded = true;
             }
 

@@ -22,7 +22,7 @@ import java.io.IOException;
 import com.google.common.collect.Collections2;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.Row.Deletion;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -224,7 +224,7 @@ public class UnfilteredSerializer
         if ((flags & HAS_ALL_COLUMNS) == 0)
             Columns.serializer.serializeSubset(Collections2.transform(row, ColumnData::column), headerColumns, out);
 
-        SearchIterator<ColumnDefinition, ColumnDefinition> si = headerColumns.iterator();
+        SearchIterator<ColumnMetadata, ColumnMetadata> si = headerColumns.iterator();
 
         try
         {
@@ -232,9 +232,9 @@ public class UnfilteredSerializer
                 // We can obtain the column for data directly from data.column(). However, if the cell/complex data
                 // originates from a sstable, the column we'll get will have the type used when the sstable was serialized,
                 // and if that type have been recently altered, that may not be the type we want to serialize the column
-                // with. So we use the ColumnDefinition from the "header" which is "current". Also see #11810 for what
+                // with. So we use the ColumnMetadata from the "header" which is "current". Also see #11810 for what
                 // happens if we don't do that.
-                ColumnDefinition column = si.next(cd.column());
+                ColumnMetadata column = si.next(cd.column());
                 assert column != null : cd.column.toString();
 
                 try
@@ -259,7 +259,7 @@ public class UnfilteredSerializer
         }
     }
 
-    private void writeComplexColumn(ComplexColumnData data, ColumnDefinition column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header, DataOutputPlus out)
+    private void writeComplexColumn(ComplexColumnData data, ColumnMetadata column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header, DataOutputPlus out)
     throws IOException
     {
         if (hasComplexDeletion)
@@ -347,10 +347,10 @@ public class UnfilteredSerializer
         if (!hasAllColumns)
             size += Columns.serializer.serializedSubsetSize(Collections2.transform(row, ColumnData::column), header.columns(isStatic));
 
-        SearchIterator<ColumnDefinition, ColumnDefinition> si = headerColumns.iterator();
+        SearchIterator<ColumnMetadata, ColumnMetadata> si = headerColumns.iterator();
         for (ColumnData data : row)
         {
-            ColumnDefinition column = si.next(data.column());
+            ColumnMetadata column = si.next(data.column());
             assert column != null;
 
             if (data.column.isSimple())
@@ -362,7 +362,7 @@ public class UnfilteredSerializer
         return size;
     }
 
-    private long sizeOfComplexColumn(ComplexColumnData data, ColumnDefinition column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header)
+    private long sizeOfComplexColumn(ComplexColumnData data, ColumnMetadata column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header)
     {
         long size = 0;
 
@@ -413,7 +413,42 @@ public class UnfilteredSerializer
         return 1;
     }
 
+    /**
+     * Deserialize an {@link Unfiltered} from the provided input.
+     *
+     * @param in the input from which to deserialize.
+     * @param header serialization header corresponding to the serialized data.
+     * @param helper the helper to use for deserialization.
+     * @param builder a row builder, passed here so we don't allocate a new one for every new row.
+     * @return the deserialized {@link Unfiltered} or {@code null} if we've read the end of a partition. This method is
+     * guaranteed to never return empty rows.
+     */
     public Unfiltered deserialize(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
+    throws IOException
+    {
+        while (true)
+        {
+            Unfiltered unfiltered = deserializeOne(in, header, helper, builder);
+            if (unfiltered == null)
+                return null;
+
+            // Skip empty rows, see deserializeOne javadoc
+            if (!unfiltered.isEmpty())
+                return unfiltered;
+        }
+    }
+
+    /**
+     * Deserialize a single {@link Unfiltered} from the provided input.
+     * <p>
+     * <b>WARNING:</b> this can return an empty row because it's possible there is a row serialized, but that row only
+     * contains data for dropped columns, see CASSANDRA-13337. But as most code expect rows to not be empty, this isn't
+     * meant to be exposed publicly.
+     *
+     * But as {@link UnfilteredRowIterator} should not return empty
+     * rows, this mean consumer of this method should make sure to skip said empty rows.
+     */
+    private Unfiltered deserializeOne(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
     throws IOException
     {
         // It wouldn't be wrong per-se to use an unsorted builder, but it would be inefficient so make sure we don't do it by mistake
@@ -437,13 +472,7 @@ public class UnfilteredSerializer
                 throw new IOException("Corrupt flags value for unfiltered partition (isStatic flag set): " + flags);
 
             builder.newRow(Clustering.serializer.deserialize(in, helper.version, header.clusteringTypes()));
-            Row row = deserializeRowBody(in, header, helper, flags, extendedFlags, builder);
-            // we do not write empty rows because Rows.collectStats(), called by BTW.applyToRow(), asserts that rows are not empty
-            // if we don't throw here, then later the very same assertion in Rows.collectStats() will fail compactions
-            // see BlackListingCompactionsTest and CASSANDRA-9530 for details
-            if (row.isEmpty())
-                throw new IOException("Corrupt empty row found in unfiltered partition");
-            return row;
+            return deserializeRowBody(in, header, helper, flags, extendedFlags, builder);
         }
     }
 
@@ -602,7 +631,7 @@ public class UnfilteredSerializer
         }
     }
 
-    private void readSimpleColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder, LivenessInfo rowLiveness)
+    private void readSimpleColumn(ColumnMetadata column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder, LivenessInfo rowLiveness)
     throws IOException
     {
         if (helper.includes(column))
@@ -617,7 +646,7 @@ public class UnfilteredSerializer
         }
     }
 
-    private void readComplexColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, boolean hasComplexDeletion, Row.Builder builder, LivenessInfo rowLiveness)
+    private void readComplexColumn(ColumnMetadata column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, boolean hasComplexDeletion, Row.Builder builder, LivenessInfo rowLiveness)
     throws IOException
     {
         if (helper.includes(column))
@@ -667,7 +696,7 @@ public class UnfilteredSerializer
         in.skipBytesFully(markerSize);
     }
 
-    private void skipComplexColumn(DataInputPlus in, ColumnDefinition column, SerializationHeader header, boolean hasComplexDeletion)
+    private void skipComplexColumn(DataInputPlus in, ColumnMetadata column, SerializationHeader header, boolean hasComplexDeletion)
     throws IOException
     {
         if (hasComplexDeletion)

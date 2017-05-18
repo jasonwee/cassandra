@@ -26,8 +26,12 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.monitoring.ApproximateTime;
 import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.metrics.HintsServiceMetrics;
 import org.apache.cassandra.net.IAsyncCallbackWithFailure;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
@@ -41,6 +45,8 @@ import org.apache.cassandra.utils.concurrent.SimpleCondition;
  */
 final class HintsDispatcher implements AutoCloseable
 {
+    private static final Logger logger = LoggerFactory.getLogger(HintsDispatcher.class);
+
     private enum Action { CONTINUE, ABORT }
 
     private final HintsReader reader;
@@ -126,11 +132,33 @@ final class HintsDispatcher implements AutoCloseable
         if (action == Action.ABORT)
             return action;
 
+        boolean hadFailures = false;
         for (Callback cb : callbacks)
-            if (cb.await() != Callback.Outcome.SUCCESS)
-                return Action.ABORT;
+        {
+            Callback.Outcome outcome = cb.await();
+            updateMetrics(outcome);
 
-        return Action.CONTINUE;
+            if (outcome != Callback.Outcome.SUCCESS)
+                hadFailures = true;
+        }
+
+        return hadFailures ? Action.ABORT : Action.CONTINUE;
+    }
+
+    private void updateMetrics(Callback.Outcome outcome)
+    {
+        switch (outcome)
+        {
+            case SUCCESS:
+                HintsServiceMetrics.hintsSucceeded.mark();
+                break;
+            case FAILURE:
+                HintsServiceMetrics.hintsFailed.mark();
+                break;
+            case TIMEOUT:
+                HintsServiceMetrics.hintsTimedOut.mark();
+                break;
+        }
     }
 
     /*
@@ -150,7 +178,7 @@ final class HintsDispatcher implements AutoCloseable
 
     private Callback sendHint(Hint hint)
     {
-        Callback callback = new Callback();
+        Callback callback = new Callback(hint.creationTime);
         HintMessage message = new HintMessage(hostId, hint);
         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
         return callback;
@@ -162,19 +190,25 @@ final class HintsDispatcher implements AutoCloseable
 
     private Callback sendEncodedHint(ByteBuffer hint)
     {
-        Callback callback = new Callback();
         EncodedHintMessage message = new EncodedHintMessage(hostId, hint, messagingVersion);
+        Callback callback = new Callback(message.getHintCreationTime());
         MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);
         return callback;
     }
 
     private static final class Callback implements IAsyncCallbackWithFailure
     {
-        enum Outcome { SUCCESS, TIMEOUT, FAILURE }
+        enum Outcome { SUCCESS, TIMEOUT, FAILURE, INTERRUPTED }
 
         private final long start = System.nanoTime();
         private final SimpleCondition condition = new SimpleCondition();
         private volatile Outcome outcome;
+        private final long hintCreationTime;
+
+        private Callback(long hintCreationTime)
+        {
+            this.hintCreationTime = hintCreationTime;
+        }
 
         Outcome await()
         {
@@ -187,7 +221,8 @@ final class HintsDispatcher implements AutoCloseable
             }
             catch (InterruptedException e)
             {
-                throw new AssertionError(e);
+                logger.warn("Hint dispatch was interrupted", e);
+                return Outcome.INTERRUPTED;
             }
 
             return timedOut ? Outcome.TIMEOUT : outcome;
@@ -201,6 +236,7 @@ final class HintsDispatcher implements AutoCloseable
 
         public void response(MessageIn msg)
         {
+            HintsServiceMetrics.updateDelayMetrics(msg.from, ApproximateTime.currentTimeMillis() - this.hintCreationTime);
             outcome = Outcome.SUCCESS;
             condition.signalAll();
         }
@@ -208,6 +244,12 @@ final class HintsDispatcher implements AutoCloseable
         public boolean isLatencyForSnitch()
         {
             return false;
+        }
+
+        @Override
+        public boolean supportsBackPressure()
+        {
+            return true;
         }
     }
 }

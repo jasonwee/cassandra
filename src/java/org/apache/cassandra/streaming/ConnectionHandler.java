@@ -61,14 +61,15 @@ public class ConnectionHandler
     private static final Logger logger = LoggerFactory.getLogger(ConnectionHandler.class);
 
     private final StreamSession session;
-    private int incomingSocketTimeout;
 
     private IncomingMessageHandler incoming;
     private OutgoingMessageHandler outgoing;
+    private final boolean isPreview;
 
-    ConnectionHandler(StreamSession session, int incomingSocketTimeout)
+    ConnectionHandler(StreamSession session, int incomingSocketTimeout, boolean isPreview)
     {
         this.session = session;
+        this.isPreview = isPreview;
         this.incoming = new IncomingMessageHandler(session, incomingSocketTimeout);
         this.outgoing = new OutgoingMessageHandler(session);
     }
@@ -86,12 +87,10 @@ public class ConnectionHandler
         logger.debug("[Stream #{}] Sending stream init for incoming stream", session.planId());
         Socket incomingSocket = session.createConnection();
         incoming.start(incomingSocket, StreamMessage.CURRENT_VERSION, true);
-        incomingSocket.shutdownOutput();
 
         logger.debug("[Stream #{}] Sending stream init for outgoing stream", session.planId());
         Socket outgoingSocket = session.createConnection();
         outgoing.start(outgoingSocket, StreamMessage.CURRENT_VERSION, true);
-        outgoingSocket.shutdownInput();
     }
 
     /**
@@ -104,15 +103,9 @@ public class ConnectionHandler
     public void initiateOnReceivingSide(IncomingStreamingConnection connection, boolean isForOutgoing, int version) throws IOException
     {
         if (isForOutgoing)
-        {
             outgoing.start(connection, version);
-            outgoing.socket.shutdownInput();
-        }
         else
-        {
             incoming.start(connection, version);
-            incoming.socket.shutdownOutput();
-        }
     }
 
     public ListenableFuture<?> close()
@@ -150,6 +143,9 @@ public class ConnectionHandler
     {
         if (outgoing.isClosed())
             throw new RuntimeException("Outgoing stream handler has been closed");
+
+        if (message.type == StreamMessage.Type.FILE && isPreview)
+            throw new RuntimeException("Cannot send file messages for preview streaming sessions");
 
         outgoing.enqueue(message);
     }
@@ -200,14 +196,14 @@ public class ConnectionHandler
         @SuppressWarnings("resource")
         private void sendInitMessage() throws IOException
         {
-            StreamInitMessage message = new StreamInitMessage(
-                    FBUtilities.getBroadcastAddress(),
-                    session.sessionIndex(),
-                    session.planId(),
-                    session.description(),
-                    !isOutgoingHandler,
-                    session.keepSSTableLevel(),
-                    session.isIncremental());
+            StreamInitMessage message = new StreamInitMessage(FBUtilities.getBroadcastAddress(),
+                                                              session.sessionIndex(),
+                                                              session.planId(),
+                                                              session.streamOperation(),
+                                                              !isOutgoingHandler,
+                                                              session.keepSSTableLevel(),
+                                                              session.getPendingRepair(),
+                                                              session.getPreviewKind());
             ByteBuffer messageBuf = message.createMessage(false, protocolVersion);
             DataOutputStreamPlus out = getWriteChannel(socket);
             out.write(messageBuf);

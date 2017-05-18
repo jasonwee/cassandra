@@ -106,7 +106,7 @@ public class MatcherResponse
                     if (payload == null)
                         return null;
                     else
-                        return MessageIn.create(to, payload, Collections.emptyMap(), verb, MessagingService.current_version, MessageIn.createTimestamp());
+                        return MessageIn.create(to, payload, Collections.emptyMap(), verb, MessagingService.current_version);
                 },
                 limit);
     }
@@ -173,16 +173,22 @@ public class MatcherResponse
                         assert !sendResponses.contains(id) : "ID re-use for outgoing message";
                         sendResponses.add(id);
                     }
-                    MessageIn<?> response = fnResponse.apply(message, to);
-                    if (response != null)
+
+                    // create response asynchronously to match request/response communication execution behavior
+                    new Thread(() ->
                     {
-                        CallbackInfo cb = MessagingService.instance().getRegisteredCallback(id);
-                        if (cb != null)
-                            cb.callback.response(response);
-                        else
-                            MessagingService.instance().receive(response, id);
-                        spy.matchingResponse(response);
-                    }
+                        MessageIn<?> response = fnResponse.apply(message, to);
+                        if (response != null)
+                        {
+                            CallbackInfo cb = MessagingService.instance().getRegisteredCallback(id);
+                            if (cb != null)
+                                cb.callback.response(response);
+                            else
+                                MessagingService.instance().receive(response, id);
+                            spy.matchingResponse(response);
+                        }
+                    }).start();
+
                     return false;
                 }
                 return true;
