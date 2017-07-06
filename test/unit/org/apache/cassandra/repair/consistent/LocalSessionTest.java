@@ -303,7 +303,7 @@ public class LocalSessionTest extends AbstractRepairTest
         Assert.assertEquals(session, sessions.loadUnsafe(sessionID));
 
         // ...and we should have sent a success message back to the coordinator
-        assertMessagesSent(sessions, COORDINATOR, new FailSession(sessionID));
+        assertMessagesSent(sessions, COORDINATOR, new PrepareConsistentResponse(sessionID, PARTICIPANT1, false));
 
     }
 
@@ -580,6 +580,19 @@ public class LocalSessionTest extends AbstractRepairTest
     }
 
     @Test
+    public void handleStatusResponseFinalizedRedundant() throws Exception
+    {
+        UUID sessionID = registerSession();
+        InstrumentedLocalSessions sessions = new InstrumentedLocalSessions();
+        sessions.start();
+        LocalSession session = sessions.prepareForTest(sessionID);
+        session.setState(FINALIZED);
+
+        sessions.handleStatusResponse(PARTICIPANT1, new StatusResponse(sessionID, FINALIZED));
+        Assert.assertEquals(FINALIZED, session.getState());
+    }
+
+    @Test
     public void handleStatusResponseFailed() throws Exception
     {
         UUID sessionID = registerSession();
@@ -587,6 +600,19 @@ public class LocalSessionTest extends AbstractRepairTest
         sessions.start();
         LocalSession session = sessions.prepareForTest(sessionID);
         session.setState(FINALIZE_PROMISED);
+
+        sessions.handleStatusResponse(PARTICIPANT1, new StatusResponse(sessionID, FAILED));
+        Assert.assertEquals(FAILED, session.getState());
+    }
+
+    @Test
+    public void handleStatusResponseFailedRedundant() throws Exception
+    {
+        UUID sessionID = registerSession();
+        InstrumentedLocalSessions sessions = new InstrumentedLocalSessions();
+        sessions.start();
+        LocalSession session = sessions.prepareForTest(sessionID);
+        session.setState(FAILED);
 
         sessions.handleStatusResponse(PARTICIPANT1, new StatusResponse(sessionID, FAILED));
         Assert.assertEquals(FAILED, session.getState());
